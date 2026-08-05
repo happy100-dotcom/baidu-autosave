@@ -79,10 +79,13 @@ def api_retry(max_retries=1, delay_range=(2, 3), exclude_errors=None):
 class BaiduStorage:
     def __init__(self):
         self._client_lock = Lock()  # 添加客户端初始化锁
-        self.config = self._load_config()
+        # Use ConfigManager as the single source of truth for config
+        self._config_mgr = ConfigManager()
+        self.config = self._config_mgr.config
         # 确保所有任务都有 task_uid
         if self._ensure_task_uids():
-            self._save_config(update_scheduler=False)
+            self._config_mgr.save_config()
+            self.config = self._config_mgr.config
         self.client = None
         self._init_client()
         self.last_request_time = 0
@@ -590,33 +593,59 @@ class BaiduStorage:
 
         return None
 
-    def resolve_task(self, task_ref=None, task_uid=None, order=None, url=None):
-        """按 task_uid/order/url 解析任务，优先使用稳定标识。"""
+    def resolve_task(self, task_ref=None, task_uid=None, order=None, url=None, legacy=False):
+        """按 task_uid 解析任务。
+
+        Priority:
+        1. task_uid (primary key — no fallback)
+        2. legacy mode only: order, then url
+
+        Args:
+            task_ref: dict (extracts task_uid) or str (32-hex = task_uid, else url).
+            task_uid: Explicit task UID.
+            order: Legacy order number (only used if legacy=True).
+            url: Legacy URL (only used if legacy=True).
+            legacy: If True, fall back to order/url when task_uid not found.
+
+        Returns:
+            Task dict, or None.
+        """
         if isinstance(task_ref, dict):
             task_uid = task_uid or task_ref.get('task_uid')
-            order = order if order is not None else task_ref.get('order')
-            url = url or task_ref.get('url')
+            if not legacy:
+                order = None
+                url = None
+            else:
+                order = order if order is not None else task_ref.get('order')
+                url = url or task_ref.get('url')
         elif isinstance(task_ref, str):
             if len(task_ref) == 32 and all(ch in '0123456789abcdef' for ch in task_ref.lower()):
                 task_uid = task_uid or task_ref
             else:
-                url = url or task_ref
+                if legacy:
+                    url = url or task_ref
         elif isinstance(task_ref, int):
-            order = order if order is not None else task_ref
+            if legacy:
+                order = order if order is not None else task_ref
 
-        task = self.get_task_by_uid(task_uid)
-        if task is not None:
-            return task
+        if task_uid:
+            task = self.get_task_by_uid(task_uid)
+            if task is not None:
+                return task
+            # task_uid provided but not found — return None, never fall back
+            return None
 
-        task = self.get_task_by_order(order)
-        if task is not None:
-            return task
-
-        if url:
-            tasks = self.config['baidu'].get('tasks', [])
-            for item in tasks:
-                if item.get('url') == url:
-                    return item
+        # Legacy fallback (migration only)
+        if legacy:
+            if order is not None:
+                task = self.get_task_by_order(order)
+                if task is not None:
+                    return task
+            if url:
+                tasks = self.config['baidu'].get('tasks', [])
+                for item in tasks:
+                    if item.get('url') == url:
+                        return item
 
         return None
 
@@ -1908,71 +1937,55 @@ class BaiduStorage:
             logger.error("异常详情:", exc_info=True)
             raise
 
-    def update_task_status(self, task_url, status, message=None, error=None, transferred_files=None):
+    def update_task_status(self, task_uid, status, message=None, error=None, transferred_files=None):
         """更新任务状态（状态机版本）
 
-        Args:
-            task_url: 任务URL或task_uid
-            status: 任务状态
-            message: 状态消息
-            error: 错误信息（如果有）
-            transferred_files: 成功转存的文件列表
+        Uses task_uid as the ONLY lookup key.  No fallback to URL or order.
 
         Status transitions:
-          - 'running': 可以随时设置
-          - 'success'/'skipped'/'partial': 终端状态，设置后自动重置为 'idle'
-          - 'failed'/'timed_out'/'cancelled': 终端状态，保持
-          - 'idle': 重置消息和错误
-          - 旧版兼容: 'normal' -> 'idle', 'error' -> 'failed'
+          - 'running': can always be set.
+          - Terminal states ('success', 'skipped', 'partial', 'failed',
+            'timed_out', 'cancelled'): persist until the next run starts.
+          - 'idle': resets message and error.
+
+        Status is NEVER inferred from message content.  Terminal states
+        are NEVER auto-reset to idle.
         """
         try:
             tasks = self.config['baidu']['tasks']
             for task in tasks:
-                # 兼容 task_uid 和 URL 两种查找方式
-                if task.get('url') == task_url or task.get('task_uid') == task_url:
-                    # ── 旧版状态兼容 ──────────────────────────────────
-                    # 'normal' 是旧版 "成功" 状态，映射为 'idle'
-                    # 'error' 是旧版 "失败" 状态，映射为 'failed'
-                    mapped_status = status
-                    if mapped_status == 'normal':
-                        mapped_status = 'idle'
-                    elif mapped_status == 'error':
-                        mapped_status = 'failed'
+                if task.get('task_uid') != task_uid:
+                    continue
 
-                    # ── 状态机转换 ────────────────────────────────────
-                    if message and any(kw in message for kw in ('成功', '没有新文件需要转存')):
-                        # 自动检测成功消息
-                        task['status'] = 'success'
-                        task['last_execute_time'] = int(time.time())
-                        task['last_run'] = int(time.time())
-                    elif mapped_status in VALID_STATUSES:
-                        task['status'] = mapped_status
-                        task['last_run'] = int(time.time())
-                    else:
-                        logger.warning(f'Unknown status "{mapped_status}", falling back to "failed"')
-                        task['status'] = 'failed'
+                # Status mapping for backward compat
+                mapped_status = status
+                if mapped_status == 'normal':
+                    mapped_status = 'idle'
+                elif mapped_status == 'error':
+                    mapped_status = 'failed'
 
-                    # ── 消息字段 ──────────────────────────────────────
-                    if message is not None:
-                        task['message'] = message
-                    if error is not None:
-                        task['error'] = error
-                        task['status'] = 'failed'
-                    elif mapped_status == 'failed' and message:
-                        task['error'] = message
-                    if transferred_files is not None:
-                        task['transferred_files'] = transferred_files
-                    if 'last_execute_time' not in task:
-                        task['last_execute_time'] = int(time.time())
+                # Set status (only if valid)
+                if mapped_status in VALID_STATUSES:
+                    task['status'] = mapped_status
+                    task['last_run'] = int(time.time())
+                else:
+                    logger.warning(f'Unknown status "{mapped_status}", ignoring')
+                    return False
 
-                    # ── 终端状态自动重置 ──────────────────────────────
-                    if task['status'] in ('success', 'skipped', 'partial'):
-                        task['status'] = 'idle'
-                        task['last_execute_time'] = int(time.time())
+                # Message fields
+                if message is not None:
+                    task['message'] = message
+                if error is not None:
+                    task['error'] = error
+                if transferred_files is not None:
+                    task['transferred_files'] = transferred_files
+                if 'last_execute_time' not in task:
+                    task['last_execute_time'] = int(time.time())
 
-                    self._save_config()
-                    logger.info(f"已更新任务状态: {task_url} -> {task['status']} ({message})")
-                    return True
+                # Save config (no scheduler reload for status-only changes)
+                self._save_config(update_scheduler=False)
+                logger.info(f"已更新任务状态: {task_uid} -> {task['status']} ({message})")
+                return True
             return False
         except Exception as e:
             logger.error(f"更新任务状态失败: {str(e)}")
@@ -2400,7 +2413,7 @@ class BaiduStorage:
             raise
 
     def update_task_status_by_order(self, order, status, message=None, error=None, transferred_files=None):
-        """基于order更新任务状态（状态机版本）
+        """基于order更新任务状态（legacy compat）
         Args:
             order: 任务顺序号
             status: 任务状态
@@ -2412,25 +2425,20 @@ class BaiduStorage:
             tasks = self.config['baidu']['tasks']
             for task in tasks:
                 if task.get('order') == order:
-                    # 委托给主状态机方法（通过 task_uid）
                     task_uid = task.get('task_uid')
                     if task_uid:
                         return self.update_task_status(
                             task_uid, status, message, error, transferred_files
                         )
 
-                    # 无 task_uid 时的回退（旧数据）
-                    # ── 旧版状态兼容 ──────────────────────────────────
+                    # 无 task_uid 时的回退（旧数据 — 无状态机推理）
                     mapped_status = status
                     if mapped_status == 'normal':
                         mapped_status = 'idle'
                     elif mapped_status == 'error':
                         mapped_status = 'failed'
 
-                    # ── 状态机转换 ────────────────────────────────────
-                    if message and any(kw in message for kw in ('成功', '没有新文件需要转存')):
-                        task['status'] = 'success'
-                    elif mapped_status in VALID_STATUSES:
+                    if mapped_status in VALID_STATUSES:
                         task['status'] = mapped_status
                     else:
                         task['status'] = 'failed'
@@ -2439,9 +2447,6 @@ class BaiduStorage:
                         task['message'] = message
                     if error is not None:
                         task['error'] = error
-                        task['status'] = 'failed'
-                    elif mapped_status == 'failed' and message:
-                        task['error'] = message
                     if transferred_files is not None:
                         task['transferred_files'] = transferred_files
 
@@ -2658,29 +2663,6 @@ class BaiduStorage:
         except Exception as e:
             logger.error(f"更新任务失败: {str(e)}")
             return False
-
-    def ensure_dir_exists(self, remote_dir):
-        """确保远程目录存在，如果不存在则创建"""
-        try:
-            if not remote_dir.startswith('/'):
-                remote_dir = '/' + remote_dir
-                
-            # 检查目录是否存在
-            cmd = f'BaiduPCS-Py ls "{remote_dir}"'
-            result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-            
-            # 如果目录不存在，则创建
-            if result.returncode != 0 and "No such file or directory" in result.stderr:
-                cmd = f'BaiduPCS-Py mkdir "{remote_dir}"'
-                result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
-                
-                if result.returncode != 0:
-                    raise Exception(f"创建目录失败: {result.stderr}")
-                    
-            return True
-        except Exception as e:
-            logger.error(f"确保目录存在失败: {str(e)}")
-            raise
 
     def share_file(self, remote_path, password=None, period_days=None):
         """分享远程文件或目录

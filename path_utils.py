@@ -3,11 +3,13 @@ Path utilities for baidu-autosave.
 
 All paths use POSIX semantics (posixpath), never os.path,
 because Baidu Pan remote paths are always POSIX-style.
+
+Security: input validation REJECTS ambiguous input rather than
+silently rewriting it.  Rejecting is safer than guessing.
 """
 
 import posixpath
 import re
-import unicodedata
 
 
 def normalize_remote_path(path):
@@ -15,20 +17,23 @@ def normalize_remote_path(path):
 
     Always returns a POSIX-style absolute path starting with '/'.
     Removes duplicate slashes, trailing slashes, and decodes URL-encoded chars.
+    Rejects '.' and '..' segments (they are not valid remote paths).
 
     Args:
         path: Raw path string.
 
     Returns:
         Normalized absolute path.
+
+    Raises:
+        ValueError: If path contains '.' or '..' segments.
     """
     if not path:
         return '/'
 
-    # Ensure string
     path = str(path)
 
-    # Decode URL-encoded chars like %20 -> space
+    # Decode URL-encoded chars
     try:
         from urllib.parse import unquote
         path = unquote(path)
@@ -44,6 +49,13 @@ def normalize_remote_path(path):
     # Strip trailing slash
     path = path.rstrip('/')
 
+    # Reject '.' and '..' segments
+    for segment in path.split('/'):
+        if segment in ('.', '..'):
+            raise ValueError(
+                f'Path must not contain "{segment}" segment: {path!r}'
+            )
+
     # Ensure leading slash
     if not path.startswith('/'):
         path = '/' + path
@@ -52,21 +64,22 @@ def normalize_remote_path(path):
 
 
 def normalize_share_relative_path(path):
-    """Normalize a share-relative path.
+    """Normalize and strictly validate a share-relative path.
 
     Share-relative paths are relative to the share root.
-    They must NOT:
-    - Be absolute (start with '/')
-    - Contain '..' segments
-    - Contain backslashes
-    - Contain empty segments
-    - Contain NUL or control characters
+    They MUST:
+    - Be relative (NOT start with '/')
+    - NOT contain '..' segments
+    - NOT contain backslashes (rejected, not converted)
+    - NOT contain empty segments
+    - NOT contain NUL or any control characters (including tab)
+    - NOT contain '.' as a standalone segment
 
     Args:
         path: Raw relative path string.
 
     Returns:
-        Normalized relative path (no leading slash).
+        Normalized relative path (no leading slash, single slashes).
 
     Raises:
         ValueError: If the path is invalid.
@@ -76,30 +89,31 @@ def normalize_share_relative_path(path):
 
     path = str(path)
 
-    # Reject NUL and control characters
+    # Reject NUL and ALL control characters (including tab)
     for ch in path:
-        if ord(ch) < 32 and ch not in ('\t',):
-            raise ValueError(f'Path contains control character: {path!r}')
+        if ord(ch) < 32:
+            raise ValueError(
+                f'Path must not contain control characters (ord={ord(ch)}): {path!r}'
+            )
 
-    # Normalize backslashes
-    path = path.replace('\\', '/')
+    # Reject backslashes outright (security: don't silently convert)
+    if '\\' in path:
+        raise ValueError(f'Path must not contain backslashes: {path!r}')
 
     # Reject absolute paths
     if path.startswith('/'):
         raise ValueError(f'Path must be relative, got absolute: {path!r}')
 
-    # Split and validate segments
+    # Split and validate each segment
     segments = path.split('/')
     clean_segments = []
     for seg in segments:
-        if not seg:
-            continue  # skip empty segments from double slashes
+        if seg == '':
+            raise ValueError(f'Path must not contain empty segments: {path!r}')
         if seg == '..':
             raise ValueError(f'Path must not contain "..": {path!r}')
         if seg == '.':
-            continue
-        if seg in ('',):
-            raise ValueError(f'Path contains empty segment: {path!r}')
+            raise ValueError(f'Path must not contain "." as a segment: {path!r}')
         clean_segments.append(seg)
 
     if not clean_segments:
@@ -146,7 +160,7 @@ def validate_save_name(name):
     if name in ('.', '..'):
         return False, None, f'save_name must not be "{name}"'
 
-    # Reject control characters
+    # Reject control characters (including tab)
     for ch in name:
         if ord(ch) < 32:
             return False, None, 'save_name must not contain control characters'
@@ -162,8 +176,7 @@ def validate_save_name(name):
 def safe_join(base, *parts):
     """Safely join path components using POSIX semantics.
 
-    Like posixpath.join, but guarantees the result stays within *base*.
-    If any part would escape base, raises ValueError.
+    Uses posixpath.commonpath to verify the result is within *base*.
 
     Args:
         base: Base directory path (absolute POSIX path).
@@ -177,21 +190,14 @@ def safe_join(base, *parts):
     """
     base = normalize_remote_path(base)
     result = posixpath.join(base, *parts)
-
-    # Normalize the result
     result = normalize_remote_path(result)
 
-    # Check that result starts with base (after normalization)
-    if not result.startswith(base):
+    # Use commonpath for boundary check (handles /base vs /base2 correctly)
+    common = posixpath.commonpath([base, result])
+    if common != base:
         raise ValueError(
-            f'Path escape detected: {result!r} is not under {base!r}'
-        )
-
-    # Also check for directory traversal
-    rel = posixpath.relpath(result, base)
-    if rel.startswith('..'):
-        raise ValueError(
-            f'Path escape detected via relpath: {result!r} is not under {base!r}'
+            f'Path escape detected: {result!r} is not under {base!r} '
+            f'(common base: {common!r})'
         )
 
     return result
@@ -215,7 +221,6 @@ def safe_join_save_dir(save_dir, save_name):
     if not save_name:
         return save_dir
 
-    # Validate save_name first
     valid, cleaned, error = validate_save_name(save_name)
     if not valid:
         raise ValueError(f'Invalid save_name: {error}')
@@ -224,19 +229,19 @@ def safe_join_save_dir(save_dir, save_name):
 
 
 def compute_final_dir(save_dir, save_name, flatten):
-    """Compute final directory, with backward-compatible flatten hint.
+    """Compute final directory.
 
-    If save_name is set and flatten is True, the final dir is
-    save_dir/save_name.  If save_name is empty, final_dir = save_dir.
+    save_dir + save_name = final_dir.
+    flatten is a separate flag indicating whether to flatten the
+    source directory structure into the final_dir.
 
     Args:
         save_dir: Base directory.
-        save_name: Optional subfolder name.
-        flatten: Whether flatten mode is active.
+        save_name: Optional subfolder name (may be empty).
+        flatten: Whether flatten mode is active (independent of save_name).
 
     Returns:
         (final_dir: str, effective_flatten: bool)
     """
     final_dir = safe_join_save_dir(save_dir, save_name)
-    effective_flatten = flatten if save_name else False
-    return final_dir, effective_flatten
+    return final_dir, flatten

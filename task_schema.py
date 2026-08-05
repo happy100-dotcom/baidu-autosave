@@ -6,7 +6,6 @@ Handles schema versioning, validation, and migration from v1 to v2.
 
 import uuid
 import copy
-import json
 import os
 import re
 import time
@@ -14,6 +13,7 @@ from datetime import datetime
 from loguru import logger
 
 from path_utils import validate_save_name, normalize_remote_path, safe_join_save_dir
+from path_utils import normalize_share_relative_path
 
 # Schema version
 SCHEMA_VERSION = 2
@@ -24,11 +24,17 @@ VALID_STATUSES = [
     'partial', 'failed', 'timed_out', 'cancelled',
 ]
 
+# Terminal statuses that persist until next run
+TERMINAL_STATUSES = {'success', 'skipped', 'partial', 'failed', 'timed_out', 'cancelled'}
+
 # Valid schedule modes
 VALID_SCHEDULE_MODES = ['inherit', 'custom', 'disabled']
 
 # Valid selection modes
 VALID_SELECTION_MODES = ['all', 'selected']
+
+# Valid save modes
+VALID_SAVE_MODES = ['preserve', 'flatten']
 
 # Valid weekdays (ISO: 1=Monday ... 7=Sunday)
 VALID_WEEKDAYS = list(range(1, 8))
@@ -66,9 +72,6 @@ def _to_iso_weekday(day):
     if isinstance(day, str):
         return WEEKDAY_REVERSE.get(day.lower()[:3], 1)
     if isinstance(day, int):
-        # Python weekday: 0=Mon, 6=Sun
-        # ISO weekday: 1=Mon, 7=Sun
-        # Cron weekday: 0=Sun, 1=Mon, 6=Sat
         if day == 0:
             return 7  # Sun in cron/python -> ISO 7
         return day  # 1-6 already match ISO 1-6
@@ -85,15 +88,24 @@ def _iso_to_cron_weekday(iso_day):
 def create_default_task(url, save_dir, pwd=None, name=None, **kwargs):
     """Create a new task dict with all required fields.
 
+    Defaults:
+    - save_name: '' (empty = no subfolder)
+    - save_mode: 'preserve' (keep directory structure)
+    - selection_mode: 'all' (transfer everything)
+    - schedule_mode: 'inherit' (use global schedule)
+
     Args:
         url: Share URL.
         save_dir: Target save directory (absolute path).
         pwd: Optional password.
         name: Optional display name.
-        **kwargs: Additional fields (save_name, flatten, etc.)
+        **kwargs: Additional fields (save_name, save_mode, etc.)
 
     Returns:
         dict: Complete task dict with schema v2 fields.
+
+    Raises:
+        ValueError: If validation fails.
     """
     task = {
         'task_uid': generate_task_uid(),
@@ -102,7 +114,7 @@ def create_default_task(url, save_dir, pwd=None, name=None, **kwargs):
         'pwd': pwd or '',
         'save_dir': normalize_remote_path(save_dir),
         'save_name': kwargs.get('save_name', ''),
-        'flatten': kwargs.get('flatten', True if kwargs.get('save_name') else False),
+        'save_mode': kwargs.get('save_mode', 'preserve'),
         'selection_mode': kwargs.get('selection_mode', 'all'),
         'selected_items': kwargs.get('selected_items', []),
         'schedule_mode': kwargs.get('schedule_mode', 'inherit'),
@@ -116,12 +128,34 @@ def create_default_task(url, save_dir, pwd=None, name=None, **kwargs):
         'order': kwargs.get('order', 0),
     }
 
-    # Validate immediately
     errors = validate_task(task)
     if errors:
         raise ValueError(f'Task validation failed: {"; ".join(errors)}')
 
     return task
+
+
+def _validate_selected_path(path, task_context=''):
+    """Validate a single selected_items path.
+
+    Returns:
+        error string, or None if valid.
+    """
+    if not path:
+        return 'selected item path must not be empty'
+
+    try:
+        normalized = normalize_share_relative_path(path)
+    except ValueError as e:
+        return f'invalid selected item path: {e}'
+
+    # Verify normalization is stable (no silent rewriting)
+    if normalized != path:
+        # Path was rewritten (e.g. backslashes->slashes, or dot segments)
+        # This is rejected as ambiguous input
+        return f'selected item path must be in canonical form, got {path!r}'
+
+    return None
 
 
 def validate_task(task):
@@ -155,6 +189,11 @@ def validate_task(task):
         if not valid:
             errors.append(f'save_name: {err_msg}')
 
+    # Validate save_mode
+    save_mode = task.get('save_mode', 'preserve')
+    if save_mode not in VALID_SAVE_MODES:
+        errors.append(f'save_mode must be one of {VALID_SAVE_MODES}')
+
     # Validate selection_mode
     sel_mode = task.get('selection_mode', 'all')
     if sel_mode not in VALID_SELECTION_MODES:
@@ -169,6 +208,11 @@ def validate_task(task):
                 continue
             if 'path' not in item:
                 errors.append('Each selected_items entry must have a "path"')
+                continue
+            # Strict path validation (P0-06)
+            path_err = _validate_selected_path(item['path'])
+            if path_err:
+                errors.append(f'selected_items[].path: {path_err}')
             if 'kind' not in item:
                 errors.append('Each selected_items entry must have a "kind"')
             elif item['kind'] not in ('file', 'dir'):
@@ -189,6 +233,8 @@ def validate_task(task):
             if not isinstance(rule, dict):
                 errors.append(f'schedule_rules[{i}] must be a dict')
                 continue
+            if 'rule_uid' not in rule:
+                errors.append(f'schedule_rules[{i}]: rule_uid is required')
             weekdays = rule.get('weekdays', [])
             if not weekdays:
                 errors.append(f'schedule_rules[{i}]: weekdays must not be empty')
@@ -198,6 +244,13 @@ def validate_task(task):
             time_val = rule.get('time', '')
             if not re.match(r'^([01]\d|2[0-3]):([0-5]\d)$', time_val):
                 errors.append(f'schedule_rules[{i}]: invalid time "{time_val}" (must be HH:MM)')
+            tz = rule.get('timezone', '')
+            if tz:
+                try:
+                    import pytz
+                    pytz.timezone(tz)
+                except Exception:
+                    errors.append(f'schedule_rules[{i}]: invalid timezone "{tz}"')
     elif sched_mode == 'disabled':
         if task.get('schedule_rules'):
             errors.append('schedule_mode=disabled requires schedule_rules to be empty')
@@ -215,6 +268,12 @@ def migrate_v1_to_v2(config):
 
     Migration is idempotent: running multiple times produces the same result.
 
+    Critical rules:
+    - Cron expressions that cannot be losslessly converted to schedule_rules
+      are preserved as raw_cron, NOT converted to a fake "every day at 00:00".
+    - save_name and save_mode are independent.
+    - Migration stops with an error report if any semantic change is detected.
+
     Args:
         config: The full config dict (from config.json).
 
@@ -224,7 +283,6 @@ def migrate_v1_to_v2(config):
     log = []
     config = copy.deepcopy(config)
 
-    # Check if already migrated
     if config.get('config_schema_version') == 2:
         log.append('Config already at schema v2, no migration needed')
         return config, log
@@ -238,11 +296,13 @@ def migrate_v1_to_v2(config):
         with open(backup_path, 'w') as f:
             f.write(backup_data)
         log.append(f'Backed up config to {backup_path}')
+        os.chmod(backup_path, 0o600)
     except Exception as e:
         log.append(f'Warning: Could not create backup: {e}')
 
     tasks = config.get('baidu', {}).get('tasks', [])
     migrated_count = 0
+    semantic_errors = []
 
     for i, task in enumerate(tasks):
         changes = []
@@ -264,17 +324,21 @@ def migrate_v1_to_v2(config):
             task['save_name'] = ''
             changes.append('added save_name=""')
 
-        # 4. Add flatten if missing
-        if 'flatten' not in task:
-            task['flatten'] = False
-            changes.append('added flatten=false')
+        # 4. Add save_mode if missing (independent of save_name)
+        if 'save_mode' not in task and 'flatten' not in task:
+            task['save_mode'] = 'preserve'
+            changes.append('added save_mode="preserve"')
+        elif 'save_mode' not in task and 'flatten' in task:
+            task['save_mode'] = 'flatten' if task.get('flatten') else 'preserve'
+            changes.append(f'migrated flatten->save_mode="{task["save_mode"]}"')
+        # Clean up old flatten field
+        task.pop('flatten', None)
 
         # 5. Migrate selection_mode
         old_selected = task.get('selected_files') or task.get('selected_items') or []
         if 'selection_mode' not in task:
             if old_selected:
                 task['selection_mode'] = 'selected'
-                # Convert old format (string list) to new format (dict list)
                 if old_selected and isinstance(old_selected[0], str):
                     task['selected_items'] = [
                         {'path': p, 'kind': 'file'} for p in old_selected
@@ -287,19 +351,25 @@ def migrate_v1_to_v2(config):
                 task['selected_items'] = []
                 changes.append('migrated selection_mode=all')
 
-        # Clean up old field names
         task.pop('selected_files', None)
 
-        # 6. Migrate schedule_mode
+        # 6. Migrate schedule_mode — PRESERVE raw cron, never fake it
         old_cron = task.get('cron')
         if 'schedule_mode' not in task:
             if old_cron and str(old_cron).strip():
-                task['schedule_mode'] = 'custom'
-                # Convert cron to schedule_rules
-                rules = _parse_legacy_cron(str(old_cron))
-                task['schedule_rules'] = rules
                 task['raw_cron'] = str(old_cron)
-                changes.append(f'migrated schedule_mode=custom ({len(rules)} rule(s))')
+                # Try to parse; if it can't be losslessly converted, keep raw_cron
+                rules = _try_parse_legacy_cron_lossless(str(old_cron))
+                if rules is not None:
+                    task['schedule_mode'] = 'custom'
+                    task['schedule_rules'] = rules
+                    changes.append(f'migrated schedule_mode=custom ({len(rules)} rule(s))')
+                else:
+                    # Cannot losslessly convert; keep raw_cron, inherit scheduling
+                    task['schedule_mode'] = 'inherit'
+                    task['schedule_rules'] = []
+                    changes.append('kept raw_cron (cannot losslessly convert to rules)')
+                    task.pop('schedule_rules', None)
             else:
                 task['schedule_mode'] = 'inherit'
                 task['schedule_rules'] = []
@@ -320,72 +390,93 @@ def migrate_v1_to_v2(config):
             migrated_count += 1
             log.append(f'Task {i} ({task.get("name", "?")}): {", ".join(changes)}')
 
-    # Set schema version
-    config['config_schema_version'] = 2
-    log.append(f'Set config_schema_version=2')
-
-    # Validate migrated config
+    # Check for semantic errors
     for i, task in enumerate(tasks):
         task_errors = validate_task(task)
         if task_errors:
-            log.append(f'WARNING: Task {i} has validation errors: {"; ".join(task_errors)}')
+            semantic_errors.append(f'Task {i}: {"; ".join(task_errors)}')
 
+    if semantic_errors:
+        log.append('SEMANTIC ERRORS (migration aborted):')
+        log.extend(f'  {e}' for e in semantic_errors)
+        log.append('Migration NOT written to config due to semantic errors')
+        config['config_schema_version'] = 1  # Keep at v1
+        return config, log
+
+    # Only write schema_version=2 if all tasks pass validation
+    config['config_schema_version'] = 2
+    log.append(f'Set config_schema_version=2')
     log.append(f'Migration complete: {migrated_count} tasks migrated')
     return config, log
 
 
-def _parse_legacy_cron(cron_str):
-    """Parse a legacy cron string into schedule_rules.
+def _try_parse_legacy_cron_lossless(cron_str):
+    """Try to losslessly convert a legacy cron expression to schedule_rules.
 
-    Handles simple cron expressions like "*/5 * * * *" or "30 20 * * 1,3,5".
+    Returns list of schedule_rule dicts if the conversion is lossless,
+    or None if the cron expression is too complex to convert.
 
-    Args:
-        cron_str: Legacy cron expression.
-
-    Returns:
-        list of schedule_rule dicts.
+    Lossless conversion only works when:
+    - minute and hour are specific values (not */n, *, ranges, or lists)
+    - day_of_week uses comma-separated specific values (0-6 or SUN-SAT)
+    - day_of_month and month are '*'
     """
     cron_str = cron_str.strip()
     parts = cron_str.split()
     if len(parts) != 5:
-        return []
+        return None
 
-    # Try to extract weekday and time
     minute = parts[0]
     hour = parts[1]
+    day_of_month = parts[2]
+    month = parts[3]
     day_of_week = parts[4]
 
-    # If minute/hour are specific values (not */n or *), extract time
-    time_str = None
+    # Must be specific day-of-month and month
+    if day_of_month != '*' or month != '*':
+        return None
+
+    # Must be specific minute and hour (not */n, *, ranges, or lists)
     try:
         m = int(minute)
         h = int(hour)
         time_str = f'{h:02d}:{m:02d}'
     except (ValueError, TypeError):
-        pass
+        return None
 
-    # If day_of_week is specific, extract weekdays
-    weekdays = []
-    if day_of_week != '*':
+    # Must be specific weekday values (comma-separated, no */n, no ranges)
+    if day_of_week == '*':
+        # Every day — a valid lossless conversion
+        weekdays = list(range(1, 8))  # 1=Mon to 7=Sun
+    else:
+        weekdays = []
         for part in day_of_week.split(','):
+            part = part.strip().upper()
             try:
-                iso_day = _to_iso_weekday(int(part))
-                weekdays.append(iso_day)
-            except (ValueError, TypeError):
-                pass
+                d = int(part)
+                if d < 0 or d > 7:
+                    return None
+                weekdays.append(_to_iso_weekday(d))
+            except ValueError:
+                # Try named weekday (SUN, MON, etc.)
+                name_map = {
+                    'SUN': 7, 'MON': 1, 'TUE': 2, 'WED': 3,
+                    'THU': 4, 'FRI': 5, 'SAT': 6,
+                }
+                if part in name_map:
+                    weekdays.append(name_map[part])
+                else:
+                    return None  # Unparseable weekday name
 
-    if not time_str or not weekdays:
-        # Fallback: store as raw_cron and create a single rule at midnight
-        return [{
-            'rule_uid': generate_rule_uid(),
-            'weekdays': list(range(1, 8)),  # every day
-            'time': '00:00',
-            'timezone': 'Asia/Shanghai',
-        }]
+    # Verify no duplicates or invalid values
+    weekdays = sorted(set(weekdays))
+    for wd in weekdays:
+        if wd not in range(1, 8):
+            return None
 
     return [{
         'rule_uid': generate_rule_uid(),
-        'weekdays': sorted(set(weekdays)),
+        'weekdays': weekdays,
         'time': time_str,
         'timezone': 'Asia/Shanghai',
     }]
@@ -419,13 +510,11 @@ def convert_rules_to_cron_triggers(rules, timezone='Asia/Shanghai'):
         except (ValueError, AttributeError):
             continue
 
-        # Convert ISO weekdays to cron format (0=Sun)
         cron_weekdays = sorted(set(_iso_to_cron_weekday(wd) for wd in weekdays))
         cron_weekday_str = ','.join(str(wd) for wd in cron_weekdays)
 
         cron_expr = f'{minute} {hour} * * {cron_weekday_str}'
 
-        # Validate the expression
         try:
             CronTrigger.from_crontab(cron_expr, timezone=pytz.timezone(tz))
             results.append((cron_expr, tz))
@@ -436,14 +525,14 @@ def convert_rules_to_cron_triggers(rules, timezone='Asia/Shanghai'):
 
 
 def convert_cron_to_rules(cron_expr):
-    """Convert a single cron expression to schedule_rules.
+    """Convert a single cron expression to schedule_rules (lossless only).
 
-    This is lossy for complex cron expressions. Used for display only.
+    This is a best-effort conversion.  Returns None for complex expressions.
 
     Args:
         cron_expr: Cron expression string.
 
     Returns:
-        list of schedule_rule dicts, or empty list if parsing fails.
+        list of schedule_rule dicts, or None if parsing fails.
     """
-    return _parse_legacy_cron(cron_expr)
+    return _try_parse_legacy_cron_lossless(cron_expr)
