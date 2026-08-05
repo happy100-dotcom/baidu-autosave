@@ -16,6 +16,13 @@ import random
 import uuid
 from functools import wraps
 
+from config_manager import ConfigManager
+from task_schema import (
+    generate_task_uid,
+    VALID_STATUSES,
+    validate_task,
+)
+
 def _format_transfer_error(error_str):
     """格式化转存错误信息，将百度API返回的模糊错误信息转换为更清晰的提示"""
     if "error_code: 4" in error_str or "存储好像出问题了" in error_str:
@@ -73,6 +80,7 @@ class BaiduStorage:
     def __init__(self):
         self._client_lock = Lock()  # 添加客户端初始化锁
         self.config = self._load_config()
+        # 确保所有任务都有 task_uid
         if self._ensure_task_uids():
             self._save_config(update_scheduler=False)
         self.client = None
@@ -174,24 +182,32 @@ class BaiduStorage:
             raise
             
     def _save_config(self, update_scheduler=True):
-        """保存配置到文件"""
+        """保存配置到文件（原子写入）"""
         try:
             # 在保存前清理 None 值的 cron 字段
             for task in self.config.get('baidu', {}).get('tasks', []):
                 if 'cron' in task and task['cron'] is None:
                     del task['cron']
-                    
-            with open('config/config.json', 'w', encoding='utf-8') as f:
-                json.dump(self.config, f, ensure_ascii=False, indent=4)
-            
-            logger.debug("配置保存成功")
-            
-            # 确保配置已经写入文件
-            with open('config/config.json', 'r', encoding='utf-8') as f:
-                saved_config = json.load(f)
-                if saved_config != self.config:
-                    logger.error("配置保存验证失败")
-                    raise Exception("配置保存验证失败")
+
+            # 原子写入：写入临时文件，然后重命名
+            config_dir = os.path.dirname('config/config.json') or '.'
+            os.makedirs(config_dir, exist_ok=True)
+
+            tmp_path = os.path.join(config_dir, f'config.json.tmp.{int(time.time())}')
+            try:
+                with open(tmp_path, 'w', encoding='utf-8') as f:
+                    json.dump(self.config, f, ensure_ascii=False, indent=4)
+                os.chmod(tmp_path, 0o644)
+                os.replace(tmp_path, 'config/config.json')
+            finally:
+                # 清理临时文件（如果重命名失败）
+                if os.path.exists(tmp_path):
+                    try:
+                        os.remove(tmp_path)
+                    except OSError:
+                        pass
+
+            logger.debug("配置保存成功（原子写入）")
             
             # 通知调度器更新任务
             if update_scheduler:
@@ -545,7 +561,7 @@ class BaiduStorage:
 
         for task in tasks:
             if not task.get('task_uid'):
-                task['task_uid'] = uuid.uuid4().hex
+                task['task_uid'] = generate_task_uid()
                 changed = True
 
         return changed
@@ -742,7 +758,7 @@ class BaiduStorage:
             return False
             
     def remove_task(self, share_url):
-        """删除转存任务
+        """删除转存任务（按URL，向后兼容）
         Args:
             share_url: 分享链接
         Returns:
@@ -752,12 +768,36 @@ class BaiduStorage:
             tasks = self.config['baidu']['tasks']
             for i, task in enumerate(tasks):
                 if task['url'] == share_url:
+                    task_uid = task.get('task_uid')
                     tasks.pop(i)
-                    # 确保更新调度器
                     self._save_config(update_scheduler=True)
-                    logger.success(f"删除任务成功: {share_url}")
+                    logger.success(f"删除任务成功: {share_url} (task_uid={task_uid})")
                     return True
             logger.warning(f"未找到任务: {share_url}")
+            return False
+        except Exception as e:
+            logger.error(f"删除任务失败: {str(e)}")
+            return False
+
+    def remove_task_by_uid(self, task_uid):
+        """删除转存任务（按稳定标识）
+        Args:
+            task_uid: 任务唯一标识
+        Returns:
+            bool: 是否删除成功
+        """
+        try:
+            tasks = self.config['baidu']['tasks']
+            for i, task in enumerate(tasks):
+                if task.get('task_uid') == task_uid:
+                    tasks.pop(i)
+                    # 重新排序
+                    for j, t in enumerate(tasks):
+                        t['order'] = j + 1
+                    self._save_config(update_scheduler=True)
+                    logger.success(f"删除任务成功: task_uid={task_uid}")
+                    return True
+            logger.warning(f"未找到任务: task_uid={task_uid}")
             return False
         except Exception as e:
             logger.error(f"删除任务失败: {str(e)}")
@@ -1869,39 +1909,67 @@ class BaiduStorage:
             raise
 
     def update_task_status(self, task_url, status, message=None, error=None, transferred_files=None):
-        """更新任务状态
+        """更新任务状态（状态机版本）
+
         Args:
-            task_url: 任务URL
-            status: 任务状态 (normal/error)
+            task_url: 任务URL或task_uid
+            status: 任务状态
             message: 状态消息
             error: 错误信息（如果有）
             transferred_files: 成功转存的文件列表
+
+        Status transitions:
+          - 'running': 可以随时设置
+          - 'success'/'skipped'/'partial': 终端状态，设置后自动重置为 'idle'
+          - 'failed'/'timed_out'/'cancelled': 终端状态，保持
+          - 'idle': 重置消息和错误
+          - 旧版兼容: 'normal' -> 'idle', 'error' -> 'failed'
         """
         try:
             tasks = self.config['baidu']['tasks']
             for task in tasks:
-                if task['url'] == task_url:
-                    # 状态转换逻辑
-                    if message and ('成功' in message or '没有新文件需要转存' in message):
-                        task['status'] = 'normal'
-                    elif status in ['success', 'skipped', 'pending', 'running']:
-                        task['status'] = 'normal'
+                # 兼容 task_uid 和 URL 两种查找方式
+                if task.get('url') == task_url or task.get('task_uid') == task_url:
+                    # ── 旧版状态兼容 ──────────────────────────────────
+                    # 'normal' 是旧版 "成功" 状态，映射为 'idle'
+                    # 'error' 是旧版 "失败" 状态，映射为 'failed'
+                    mapped_status = status
+                    if mapped_status == 'normal':
+                        mapped_status = 'idle'
+                    elif mapped_status == 'error':
+                        mapped_status = 'failed'
+
+                    # ── 状态机转换 ────────────────────────────────────
+                    if message and any(kw in message for kw in ('成功', '没有新文件需要转存')):
+                        # 自动检测成功消息
+                        task['status'] = 'success'
+                        task['last_execute_time'] = int(time.time())
+                        task['last_run'] = int(time.time())
+                    elif mapped_status in VALID_STATUSES:
+                        task['status'] = mapped_status
+                        task['last_run'] = int(time.time())
                     else:
-                        task['status'] = 'error'
-                        
-                    if message:
+                        logger.warning(f'Unknown status "{mapped_status}", falling back to "failed"')
+                        task['status'] = 'failed'
+
+                    # ── 消息字段 ──────────────────────────────────────
+                    if message is not None:
                         task['message'] = message
-                    if error:
+                    if error is not None:
                         task['error'] = error
-                        task['status'] = 'error'  # 如果有错误信息，强制设置为错误状态
-                    elif status == 'error' and message:
+                        task['status'] = 'failed'
+                    elif mapped_status == 'failed' and message:
                         task['error'] = message
-                    if transferred_files:
+                    if transferred_files is not None:
                         task['transferred_files'] = transferred_files
-                    
-                    # 添加最后执行时间
-                    task['last_execute_time'] = int(time.time())
-                    
+                    if 'last_execute_time' not in task:
+                        task['last_execute_time'] = int(time.time())
+
+                    # ── 终端状态自动重置 ──────────────────────────────
+                    if task['status'] in ('success', 'skipped', 'partial'):
+                        task['status'] = 'idle'
+                        task['last_execute_time'] = int(time.time())
+
                     self._save_config()
                     logger.info(f"已更新任务状态: {task_url} -> {task['status']} ({message})")
                     return True
@@ -2332,10 +2400,10 @@ class BaiduStorage:
             raise
 
     def update_task_status_by_order(self, order, status, message=None, error=None, transferred_files=None):
-        """基于order更新任务状态
+        """基于order更新任务状态（状态机版本）
         Args:
             order: 任务顺序号
-            status: 任务状态 (normal/error)
+            status: 任务状态
             message: 状态消息
             error: 错误信息（如果有）
             transferred_files: 成功转存的文件列表
@@ -2344,27 +2412,46 @@ class BaiduStorage:
             tasks = self.config['baidu']['tasks']
             for task in tasks:
                 if task.get('order') == order:
-                    # 状态转换逻辑
-                    if message and ('成功' in message or '没有新文件需要转存' in message):
-                        task['status'] = 'normal'
-                    elif status in ['success', 'skipped', 'pending', 'running']:
-                        task['status'] = 'normal'
+                    # 委托给主状态机方法（通过 task_uid）
+                    task_uid = task.get('task_uid')
+                    if task_uid:
+                        return self.update_task_status(
+                            task_uid, status, message, error, transferred_files
+                        )
+
+                    # 无 task_uid 时的回退（旧数据）
+                    # ── 旧版状态兼容 ──────────────────────────────────
+                    mapped_status = status
+                    if mapped_status == 'normal':
+                        mapped_status = 'idle'
+                    elif mapped_status == 'error':
+                        mapped_status = 'failed'
+
+                    # ── 状态机转换 ────────────────────────────────────
+                    if message and any(kw in message for kw in ('成功', '没有新文件需要转存')):
+                        task['status'] = 'success'
+                    elif mapped_status in VALID_STATUSES:
+                        task['status'] = mapped_status
                     else:
-                        task['status'] = 'error'
-                        
-                    if message:
+                        task['status'] = 'failed'
+
+                    if message is not None:
                         task['message'] = message
-                    if error:
+                    if error is not None:
                         task['error'] = error
-                        task['status'] = 'error'  # 如果有错误信息，强制设置为错误状态
-                    elif status == 'error' and message:
+                        task['status'] = 'failed'
+                    elif mapped_status == 'failed' and message:
                         task['error'] = message
-                    if transferred_files:
+                    if transferred_files is not None:
                         task['transferred_files'] = transferred_files
-                    
-                    # 添加最后执行时间
+
                     task['last_execute_time'] = int(time.time())
-                    
+                    task['last_run'] = int(time.time())
+
+                    # ── 终端状态自动重置 ──────────────────────────────
+                    if task['status'] in ('success', 'skipped', 'partial'):
+                        task['status'] = 'idle'
+
                     self._save_config()
                     logger.info(f"已更新任务状态: order={order} -> {task['status']} ({message})")
                     return True
@@ -2484,6 +2571,90 @@ class BaiduStorage:
             logger.success(f"更新任务成功: {tasks[task_index]}")
             return True
             
+        except Exception as e:
+            logger.error(f"更新任务失败: {str(e)}")
+            return False
+
+    def update_task_by_uid(self, task_uid, task_data):
+        """基于task_uid更新任务信息（稳定标识）
+        Args:
+            task_uid: 任务唯一标识
+            task_data: 新的任务数据
+        Returns:
+            bool: 是否更新成功
+        """
+        try:
+            tasks = self.config['baidu']['tasks']
+            task_index = None
+            for i, task in enumerate(tasks):
+                if task.get('task_uid') == task_uid:
+                    task_index = i
+                    break
+
+            if task_index is None:
+                raise ValueError(f"未找到任务: task_uid={task_uid}")
+
+            old_task = tasks[task_index].copy()
+
+            # 验证和清理URL
+            url = task_data.get('url', '').strip()
+            if not url:
+                raise ValueError("分享链接不能为空")
+            url = url.split('#')[0]
+            if not re.match(r'^https?://pan\.baidu\.com/s/[a-zA-Z0-9_-]+(\?pwd=[a-zA-Z0-9]+)?$', url):
+                raise ValueError("无效的百度网盘分享链接格式")
+
+            # 更新任务信息
+            tasks[task_index].update({
+                'name': task_data.get('name', '').strip() or old_task.get('name', ''),
+                'url': url,
+                'save_dir': task_data.get('save_dir', '').strip() or old_task.get('save_dir', ''),
+                'pwd': task_data.get('pwd') if task_data.get('pwd') is not None else old_task.get('pwd'),
+                'status': task_data.get('status', old_task.get('status', 'idle')),
+                'message': task_data.get('message', old_task.get('message', '')),
+                'last_update': int(time.time()),
+            })
+
+            # 处理分类
+            if 'category' in task_data:
+                cat = task_data['category'].strip()
+                if cat:
+                    tasks[task_index]['category'] = cat
+                else:
+                    tasks[task_index].pop('category', None)
+
+            # 处理cron
+            new_cron = task_data.get('cron')
+            if new_cron is not None:
+                if isinstance(new_cron, str) and new_cron.strip():
+                    tasks[task_index]['cron'] = new_cron.strip()
+                else:
+                    tasks[task_index].pop('cron', None)
+
+            # 处理正则表达式
+            if 'regex_pattern' in task_data:
+                rp = task_data['regex_pattern']
+                if rp and rp.strip():
+                    tasks[task_index]['regex_pattern'] = rp.strip()
+                    rr = task_data.get('regex_replace', '')
+                    tasks[task_index]['regex_replace'] = rr.strip() if rr else ''
+                else:
+                    tasks[task_index].pop('regex_pattern', None)
+                    tasks[task_index].pop('regex_replace', None)
+
+            # 保存配置并更新调度器
+            self._save_config()
+
+            from scheduler import TaskScheduler
+            if hasattr(TaskScheduler, 'instance') and TaskScheduler.instance:
+                TaskScheduler.instance.update_task_schedule(
+                    tasks[task_index], tasks[task_index].get('cron')
+                )
+                logger.info(f"已更新任务调度: {task_uid}")
+
+            logger.success(f"更新任务成功: task_uid={task_uid}")
+            return True
+
         except Exception as e:
             logger.error(f"更新任务失败: {str(e)}")
             return False
