@@ -9,7 +9,12 @@ __pycache__/
 # 配置文件
 /config/config.json
 config/config*.json
+/config/config.json.*
 git-config
+cookies.txt
+cookies.*.txt
+.env
+*.env
 
 # 日志文件
 log/
@@ -50,6 +55,7 @@ build/
 *.tmp
 *.temp
 .cache/
+*_TODO.md
 
 # Claude / OMC 本地状态
 .omc/

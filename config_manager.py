@@ -7,10 +7,10 @@ accessing/modifying config data.
 
 Key design decisions:
 - Config is stored in config/config.json (JSON file).
-- write is atomic: write to temp file, then rename.
+- write is atomic: write to temp file (mkstemp), flush+fsync, then rename.
 - On init, if schema v1 is detected, runs migration.
-- The baidu dict is the "real" config; v2 fields are at the top level
-  (config_schema_version, global_settings, etc.).
+- All public methods that modify state use a reentrant lock (RLock).
+- Running state is NOT stored here — see RunStore.
 """
 
 import copy
@@ -33,7 +33,6 @@ from task_schema import (
     create_default_task,
     generate_task_uid,
     SCHEMA_VERSION,
-    VALID_STATUSES,
     VALID_SCHEDULE_MODES,
     VALID_SELECTION_MODES,
     convert_rules_to_cron_triggers,
@@ -72,16 +71,19 @@ def _ensure_dir_exists(path):
         os.makedirs(parent, exist_ok=True)
 
 
-def _atomic_write(filepath, data, mode='w'):
+def _atomic_write(filepath, data):
     """Atomically write data to filepath.
 
-    Writes to a temp file in the same directory, then renames.
-    This prevents partial writes from corrupting the config.
+    Uses tempfile.mkstemp for unique temp file, flush+fsync on the fd,
+    chmod 0600, os.replace for atomic swap, and fsync on the parent
+    directory for durable metadata.
 
     Args:
         filepath: Target file path.
         data: String data to write.
-        mode: File open mode ('w' or 'wb').
+
+    Raises:
+        IOError: If write fails; original file is preserved.
     """
     _ensure_dir_exists(filepath)
     dir_path = os.path.dirname(filepath) or '.'
@@ -91,19 +93,40 @@ def _atomic_write(filepath, data, mode='w'):
         dir=dir_path,
     )
     try:
-        if mode == 'wb':
-            os.write(fd, data)
+        if isinstance(data, str):
+            data_bytes = data.encode('utf-8')
         else:
-            if isinstance(data, str):
-                data = data.encode('utf-8')
-            os.write(fd, data)
+            data_bytes = data
+
+        os.write(fd, data_bytes)
+        os.flush(fd)     # flush Python-level buffer
+        os.fsync(fd)     # fsync to disk
         os.close(fd)
-        os.chmod(tmp_path, 0o644)
+        fd = None        # prevent double-close
+
+        # Restrict permissions before rename
+        os.chmod(tmp_path, 0o600)
+
+        # Atomic swap
         os.replace(tmp_path, filepath)
-    except Exception:
-        # Clean up temp file on failure
+
+        # fsync parent directory so the rename is durable
+        dir_fd = os.open(dir_path, os.O_RDONLY)
         try:
-            os.unlink(tmp_path)
+            os.fsync(dir_fd)
+        finally:
+            os.close(dir_fd)
+
+    except Exception:
+        # Clean up temp file on failure; original file is untouched
+        if fd is not None:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            if os.path.exists(tmp_path):
+                os.unlink(tmp_path)
         except OSError:
             pass
         raise
@@ -139,7 +162,6 @@ def _serialize_json(data, indent=2):
     Returns:
         JSON string.
     """
-    # Ensure keys are sorted for consistency
     return json.dumps(data, ensure_ascii=False, indent=indent, sort_keys=True) + '\n'
 
 
@@ -148,15 +170,16 @@ def _serialize_json(data, indent=2):
 class ConfigManager:
     """Manages configuration loading, saving, migration, and access.
 
-    Thread-safe: all public methods that modify state use a lock.
+    Thread-safe: all public methods that modify state use a reentrant lock
+    (RLock) so that internal helper methods can safely call each other.
     """
 
     _instance = None
-    _lock = threading.Lock()
+    _singleton_lock = threading.Lock()
 
     def __new__(cls, *args, **kwargs):
         if cls._instance is None:
-            with cls._lock:
+            with cls._singleton_lock:
                 if cls._instance is None:
                     cls._instance = super().__new__(cls)
         return cls._instance
@@ -173,7 +196,7 @@ class ConfigManager:
         self._config_path = config_path or DEFAULT_CONFIG_PATH
         self._config_dir = os.path.dirname(self._config_path)
         self._config = {}
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()  # RLock prevents deadlock on nested calls
         self._loaded = False
         self._initialized = False
 
@@ -192,7 +215,6 @@ class ConfigManager:
         config = _read_json(self._config_path, default=None)
 
         if config is None:
-            # Create default config
             config = self._create_default_config()
             self._config = config
             self._save_config_internal()
@@ -202,7 +224,6 @@ class ConfigManager:
             self._config = config
             self._loaded = True
             logger.info(f'Loaded config from {self._config_path}')
-            logger.debug(f'Loaded config: {json.dumps(config, ensure_ascii=False)[:500]}')
 
     def _create_default_config(self):
         """Create a default config structure."""
@@ -217,7 +238,7 @@ class ConfigManager:
         }
 
     def _save_config_internal(self, data=None):
-        """Internal save (no lock, no backup)."""
+        """Internal save (caller must hold _lock)."""
         data = data or self._config
         try:
             json_str = _serialize_json(data)
@@ -227,10 +248,7 @@ class ConfigManager:
             raise
 
     def save_config(self):
-        """Public save with lock and backup.
-
-        Creates a backup before overwriting.
-        """
+        """Public save with lock and backup."""
         with self._lock:
             self._create_backup()
             self._save_config_internal()
@@ -255,6 +273,7 @@ class ConfigManager:
 
         try:
             shutil.copy2(self._config_path, backup_path)
+            os.chmod(backup_path, 0o600)
             logger.debug(f'Created config backup: {backup_path}')
         except Exception as e:
             logger.warning(f'Failed to create config backup: {e}')
@@ -312,7 +331,10 @@ class ConfigManager:
 
     @property
     def global_settings(self):
-        return self._config.get('global_settings', DEFAULT_GLOBAL_SETTINGS)
+        with self._lock:
+            return copy.deepcopy(
+                self._config.get('global_settings', DEFAULT_GLOBAL_SETTINGS)
+            )
 
     # ── task CRUD ───────────────────────────────────────────────────────
 
@@ -338,14 +360,7 @@ class ConfigManager:
             return None
 
     def get_task_by_order(self, order):
-        """Get a single task by order field.
-
-        Args:
-            order: Task order number.
-
-        Returns:
-            Task dict, or None.
-        """
+        """Get a single task by order field (legacy compat)."""
         with self._lock:
             for task in self._config.get('baidu', {}).get('tasks', []):
                 if task.get('order') == order:
@@ -353,14 +368,7 @@ class ConfigManager:
             return None
 
     def get_task_by_url(self, url):
-        """Get a task by share URL.
-
-        Args:
-            url: Share URL.
-
-        Returns:
-            Task dict, or None.
-        """
+        """Get a task by share URL (legacy compat)."""
         with self._lock:
             url = url.split('#')[0].strip()
             for task in self._config.get('baidu', {}).get('tasks', []):
@@ -376,7 +384,7 @@ class ConfigManager:
             save_dir: Target save directory.
             pwd: Optional password.
             name: Optional display name.
-            **kwargs: Additional task fields.
+            **kwargs: Additional task fields (save_name, flatten, etc.)
 
         Returns:
             (task: dict, error: str or None)
@@ -395,9 +403,7 @@ class ConfigManager:
                 if t.get('url', '').split('#')[0].strip() == clean_url:
                     return None, f'Task with URL already exists: {url}'
 
-            # Set order
             task['order'] = len(tasks) + 1
-
             tasks.append(task)
             self._save_config_internal()
 
@@ -405,10 +411,13 @@ class ConfigManager:
         return copy.deepcopy(task), None
 
     def update_task(self, task_uid, updates):
-        """Update an existing task.
+        """Update an existing task with validation.
 
-        Only the fields in *updates* are changed.  The task is re-validated
-        after applying updates.
+        Uses candidate+validate+commit pattern:
+        1. Deep-copy the existing task.
+        2. Apply only allowed fields to the candidate.
+        3. Validate the candidate.
+        4. If valid, replace the original; otherwise return 422.
 
         Args:
             task_uid: Task UID to update.
@@ -419,78 +428,39 @@ class ConfigManager:
         """
         with self._lock:
             tasks = self._config.get('baidu', {}).get('tasks', [])
-            for task in tasks:
+            for i, task in enumerate(tasks):
                 if task.get('task_uid') == task_uid:
-                    old = copy.deepcopy(task)
-                    task.update(updates)
+                    # Build candidate from deep copy
+                    candidate = copy.deepcopy(task)
+
+                    # Apply allowed updates to candidate
+                    for key in ('name', 'url', 'pwd', 'save_dir', 'save_name',
+                                'flatten', 'save_mode', 'selection_mode',
+                                'selected_items', 'schedule_mode', 'schedule_rules',
+                                'category', 'regex_pattern', 'regex_replace',
+                                'cron', 'message'):
+                        if key in updates:
+                            candidate[key] = copy.deepcopy(updates[key])
+
+                    # Validate candidate
+                    errors = validate_task(candidate)
+                    if errors:
+                        return None, f'Validation failed: {"; ".join(errors)}'
+
+                    # Replace original with validated candidate
+                    tasks[i] = candidate
                     self._save_config_internal()
                     logger.success(f'Updated task: {task_uid}')
-                    return copy.deepcopy(task), None
+                    return copy.deepcopy(candidate), None
 
             return None, f'Task not found: {task_uid}'
 
-    def update_task_status(self, task_uid, status, message=None, error=None, transferred_files=None):
-        """Update task status with state machine rules.
-
-        Status transitions:
-        - 'running': can always be set.
-        - 'success'/'skipped'/'partial': sets status to 'idle' after update.
-        - 'failed'/'timed_out'/'cancelled': terminal; stays as set.
-        - 'idle': resets message and error.
-
-        Args:
-            task_uid: Task UID.
-            status: New status string.
-            message: Optional status message.
-            error: Optional error message.
-            transferred_files: Optional list of transferred files.
-
-        Returns:
-            bool: True if successful.
-        """
-        if status not in VALID_STATUSES:
-            logger.error(f'Invalid status: {status}')
-            return False
-
-        with self._lock:
-            tasks = self._config.get('baidu', {}).get('tasks', [])
-            for task in tasks:
-                if task.get('task_uid') == task_uid:
-                    task['status'] = status
-                    task['last_run'] = int(time.time())
-
-                    if message is not None:
-                        task['message'] = message
-                    if error is not None:
-                        task['error'] = error
-                    if transferred_files is not None:
-                        task['transferred_files'] = transferred_files
-
-                    # Auto-reset terminal statuses
-                    if status in ('success', 'skipped', 'partial'):
-                        task['status'] = 'idle'
-                        task['message'] = message or ''
-
-                    self._save_config_internal()
-                    logger.info(f'Updated status: {task_uid} -> {task["status"]}')
-                    return True
-
-            logger.warning(f'Task not found: {task_uid}')
-            return False
-
-    def update_task_status_by_order(self, order, status, message=None, error=None, transferred_files=None):
-        """Update task status by order field (backward compat)."""
-        with self._lock:
-            tasks = self._config.get('baidu', {}).get('tasks', [])
-            for task in tasks:
-                if task.get('order') == order:
-                    task_uid = task.get('task_uid')
-                    if task_uid:
-                        return self.update_task_status(
-                            task_uid, status, message, error, transferred_files
-                        )
-                    return False
-            return False
+    def _find_task_uid_by_order(self, order):
+        """Internal: find task_uid by order (no lock required)."""
+        for task in self._config.get('baidu', {}).get('tasks', []):
+            if task.get('order') == order:
+                return task.get('task_uid')
+        return None
 
     def remove_task(self, task_uid):
         """Remove a task by UID.
@@ -506,7 +476,6 @@ class ConfigManager:
             for i, task in enumerate(tasks):
                 if task.get('task_uid') == task_uid:
                     tasks.pop(i)
-                    # Re-number orders
                     for j, t in enumerate(tasks):
                         t['order'] = j + 1
                     self._save_config_internal()
@@ -515,12 +484,11 @@ class ConfigManager:
             return False
 
     def remove_task_by_order(self, order):
-        """Remove a task by order (backward compat)."""
+        """Remove a task by order (legacy compat)."""
         with self._lock:
             tasks = self._config.get('baidu', {}).get('tasks', [])
             for i, task in enumerate(tasks):
                 if task.get('order') == order:
-                    task_uid = task.get('task_uid')
                     tasks.pop(i)
                     for j, t in enumerate(tasks):
                         t['order'] = j + 1
@@ -547,7 +515,6 @@ class ConfigManager:
                         tasks.pop(i)
                         removed += 1
                         break
-            # Re-number
             for j, t in enumerate(tasks):
                 t['order'] = j + 1
             if removed:
@@ -557,12 +524,10 @@ class ConfigManager:
     # ── user management ─────────────────────────────────────────────────
 
     def get_current_user(self):
-        """Get the current active user."""
         with self._lock:
             return self._config.get('baidu', {}).get('current_user', '')
 
     def set_current_user(self, username):
-        """Set the current active user."""
         with self._lock:
             baidu = self._config.setdefault('baidu', {})
             if username and username not in baidu.get('users', {}):
@@ -572,30 +537,18 @@ class ConfigManager:
             return True, None
 
     def get_users(self):
-        """Get all users."""
         with self._lock:
             return copy.deepcopy(
                 self._config.get('baidu', {}).get('users', {})
             )
 
     def get_user(self, username):
-        """Get a single user by name."""
         with self._lock:
             return copy.deepcopy(
                 self._config.get('baidu', {}).get('users', {}).get(username)
             )
 
     def add_user(self, username, cookies, name=None):
-        """Add a new user.
-
-        Args:
-            username: User identifier.
-            cookies: Cookies string.
-            name: Optional display name.
-
-        Returns:
-            (user: dict, error: str or None)
-        """
         with self._lock:
             users = self._config.setdefault('baidu', {}).setdefault('users', {})
             if username in users:
@@ -611,66 +564,37 @@ class ConfigManager:
             return copy.deepcopy(users[username]), None
 
     def update_user(self, username, cookies=None, name=None):
-        """Update an existing user.
-
-        Args:
-            username: User identifier.
-            cookies: Optional new cookies.
-            name: Optional new display name.
-
-        Returns:
-            bool: True if successful.
-        """
         with self._lock:
             users = self._config.get('baidu', {}).get('users', {})
             if username not in users:
                 return False
-
             if cookies is not None:
                 users[username]['cookies'] = cookies
             if name is not None:
                 users[username]['name'] = name
-
             self._save_config_internal()
             return True
 
     def remove_user(self, username):
-        """Remove a user.
-
-        Args:
-            username: User identifier.
-
-        Returns:
-            bool: True if removed.
-        """
         with self._lock:
             users = self._config.get('baidu', {}).get('users', {})
             if username not in users:
                 return False
             del users[username]
-
-            # If removed user was current, clear current_user
             if self._config.get('baidu', {}).get('current_user') == username:
                 self._config['baidu']['current_user'] = ''
-
             self._save_config_internal()
             return True
 
     # ── global settings ─────────────────────────────────────────────────
 
     def get_global_settings(self):
-        """Get global settings dict."""
-        return self._config.get('global_settings', DEFAULT_GLOBAL_SETTINGS)
+        with self._lock:
+            return copy.deepcopy(
+                self._config.get('global_settings', DEFAULT_GLOBAL_SETTINGS)
+            )
 
     def update_global_settings(self, updates):
-        """Update global settings.
-
-        Args:
-            updates: Dict of setting keys to update.
-
-        Returns:
-            bool: True if successful.
-        """
         with self._lock:
             settings = self._config.setdefault(
                 'global_settings',
@@ -683,21 +607,12 @@ class ConfigManager:
     # ── categories ──────────────────────────────────────────────────────
 
     def get_categories(self):
-        """Get all task categories."""
         with self._lock:
             tasks = self._config.get('baidu', {}).get('tasks', [])
             cats = {t.get('category', '') for t in tasks if t.get('category')}
             return sorted(c for c in cats if c)
 
     def get_tasks_by_category(self, category=None):
-        """Get tasks in a category.
-
-        Args:
-            category: Category name, or None for uncategorized.
-
-        Returns:
-            List of task dicts.
-        """
         with self._lock:
             tasks = self._config.get('baidu', {}).get('tasks', [])
             if category is None:
@@ -714,17 +629,14 @@ class ConfigManager:
         """
         errors = []
 
-        # Check schema version
         version = self._config.get('config_schema_version', 1)
         if version != 2:
             errors.append(('config_schema_version', f'Expected 2, got {version}'))
 
-        # Check baidu section
         baidu = self._config.get('baidu', {})
         if not baidu:
             errors.append(('baidu', 'Missing baidu section'))
 
-        # Check tasks
         tasks = baidu.get('tasks', [])
         for i, task in enumerate(tasks):
             task_errors = validate_task(task)

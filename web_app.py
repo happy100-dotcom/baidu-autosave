@@ -79,7 +79,17 @@ logger.add("log/web_app_{time:YYYY-MM-DD}.log",
           format=log_format)
 
 app = Flask(__name__)
-app.secret_key = 'your-secret-key-here'  # 用于session加密
+# SESSION_SECRET from environment — production must set this
+app.secret_key = os.environ.get('SESSION_SECRET')
+if not app.secret_key:
+    # In dev, generate a random key; production config MUST set it
+    import secrets
+    app.secret_key = secrets.token_hex(32)
+    logger.warning(
+        'SESSION_SECRET not set in environment. '
+        'Using temporary random key — sessions will break on restart. '
+        'Set SESSION_SECRET in production.'
+    )
 CORS(app)
 
 # 全局变量声明
