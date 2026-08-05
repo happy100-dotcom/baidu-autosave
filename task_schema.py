@@ -278,14 +278,17 @@ def migrate_v1_to_v2(config):
         config: The full config dict (from config.json).
 
     Returns:
-        (migrated_config: dict, log: list of str)
+        dict with keys:
+          success: bool
+          config: migrated config dict (may be partially modified even on failure)
+          log: list of str messages
     """
     log = []
     config = copy.deepcopy(config)
 
     if config.get('config_schema_version') == 2:
         log.append('Config already at schema v2, no migration needed')
-        return config, log
+        return {'success': True, 'config': config, 'log': log}
 
     # Backup before migration
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
@@ -331,7 +334,6 @@ def migrate_v1_to_v2(config):
         elif 'save_mode' not in task and 'flatten' in task:
             task['save_mode'] = 'flatten' if task.get('flatten') else 'preserve'
             changes.append(f'migrated flatten->save_mode="{task["save_mode"]}"')
-        # Clean up old flatten field
         task.pop('flatten', None)
 
         # 5. Migrate selection_mode
@@ -358,14 +360,12 @@ def migrate_v1_to_v2(config):
         if 'schedule_mode' not in task:
             if old_cron and str(old_cron).strip():
                 task['raw_cron'] = str(old_cron)
-                # Try to parse; if it can't be losslessly converted, keep raw_cron
                 rules = _try_parse_legacy_cron_lossless(str(old_cron))
                 if rules is not None:
                     task['schedule_mode'] = 'custom'
                     task['schedule_rules'] = rules
                     changes.append(f'migrated schedule_mode=custom ({len(rules)} rule(s))')
                 else:
-                    # Cannot losslessly convert; keep raw_cron, inherit scheduling
                     task['schedule_mode'] = 'inherit'
                     task['schedule_rules'] = []
                     changes.append('kept raw_cron (cannot losslessly convert to rules)')
@@ -400,14 +400,13 @@ def migrate_v1_to_v2(config):
         log.append('SEMANTIC ERRORS (migration aborted):')
         log.extend(f'  {e}' for e in semantic_errors)
         log.append('Migration NOT written to config due to semantic errors')
-        config['config_schema_version'] = 1  # Keep at v1
-        return config, log
+        config['config_schema_version'] = 1
+        return {'success': False, 'config': config, 'log': log}
 
-    # Only write schema_version=2 if all tasks pass validation
     config['config_schema_version'] = 2
     log.append(f'Set config_schema_version=2')
     log.append(f'Migration complete: {migrated_count} tasks migrated')
-    return config, log
+    return {'success': True, 'config': config, 'log': log}
 
 
 def _try_parse_legacy_cron_lossless(cron_str):

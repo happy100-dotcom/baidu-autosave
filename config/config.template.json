@@ -50,7 +50,6 @@
     },
     "auth": {
         "users": "admin",
-        "password": "",
         "password_hash": "",
         "session_timeout": 3600
     }

@@ -98,11 +98,12 @@ def _atomic_write(filepath, data):
         else:
             data_bytes = data
 
-        os.write(fd, data_bytes)
-        os.flush(fd)     # flush Python-level buffer
-        os.fsync(fd)     # fsync to disk
-        os.close(fd)
-        fd = None        # prevent double-close
+        # Use fdopen to get a proper file object, then flush+fsync via fileno
+        with os.fdopen(fd, 'wb') as f:
+            fd = None          # fd is now owned by the file object
+            f.write(data_bytes)
+            f.flush()          # flush Python-level buffer
+            os.fsync(f.fileno())  # fsync to disk
 
         # Restrict permissions before rename
         os.chmod(tmp_path, 0o600)
@@ -253,6 +254,29 @@ class ConfigManager:
             self._create_backup()
             self._save_config_internal()
 
+    def import_and_save_config(self, config_dict):
+        """Import an external config dict and persist it atomically.
+
+        This is the bridge for legacy code that still modifies config
+        copies.  Takes the config under RLock, deep-copies the data,
+        validates it, and writes atomically.
+
+        Args:
+            config_dict: A config dict (e.g. from a modified copy).
+
+        Returns:
+            bool: True if successful.
+        """
+        with self._lock:
+            try:
+                # Deep-copy the incoming data to prevent external mutations
+                self._config = copy.deepcopy(config_dict)
+                self._save_config_internal()
+                return True
+            except Exception as e:
+                logger.error(f'Failed to import config: {e}')
+                return False
+
     def _create_backup(self, keep_max=5):
         """Create a timestamped backup of the current config file.
 
@@ -292,7 +316,11 @@ class ConfigManager:
             logger.warning(f'Failed to clean up backups: {e}')
 
     def _maybe_migrate(self):
-        """Check schema version and migrate if needed."""
+        """Check schema version and migrate if needed.
+
+        On failure, keeps the original config and logs an error.
+        Does NOT save the partially migrated config.
+        """
         version = self._config.get('config_schema_version', 1)
 
         if version == 2:
@@ -302,11 +330,20 @@ class ConfigManager:
         if version < 2:
             logger.info(f'Migrating config from schema v{version} to v2...')
             with self._lock:
-                migrated, log = migrate_v1_to_v2(self._config)
-                self._config = migrated
-                self._save_config_internal()
-                for line in log:
+                result = migrate_v1_to_v2(self._config)
+                for line in result['log']:
                     logger.info(f'Migration: {line}')
+
+                if not result['success']:
+                    logger.error(
+                        'Migration aborted due to semantic errors. '
+                        'Original config preserved. '
+                        'Fix the errors and try again.'
+                    )
+                    return
+
+                self._config = result['config']
+                self._save_config_internal()
             logger.success('Config migration complete')
 
     # ── public accessors ────────────────────────────────────────────────

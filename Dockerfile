@@ -12,8 +12,8 @@ RUN npm ci
 # 复制前端源码
 COPY frontend/ .
 
-# 构建前端（跳过类型检查以避免构建失败）
-RUN npm run build:prod
+# 构建前端（包含类型检查 vue-tsc）
+RUN npm run build
 
 # 阶段2: 安装后端依赖
 FROM python:3.10-slim AS backend-builder
@@ -58,9 +58,13 @@ COPY --from=frontend-builder /app/frontend/dist/ static/
 # 复制配置模板
 COPY config/config.template.json ./template/config.template.json
 
+# 创建非root用户
+RUN useradd -m -u 1000 -s /bin/bash appuser
+
 # 创建目录并设置权限
 RUN mkdir -p config log template && \
-    chmod -R 777 config log template
+    chmod 750 config log template && \
+    chmod 640 template/config.template.json
 
 # 创建启动脚本
 RUN echo '#!/bin/sh\n\
@@ -71,7 +75,7 @@ sleep 2\n\
 if [ ! -f /app/config/config.json ]; then\n\
     echo "配置文件不存在，从模板创建..."\n\
     cp /app/template/config.template.json /app/config/config.json\n\
-    chmod 666 /app/config/config.json\n\
+    chmod 600 /app/config/config.json\n\
     echo "已从模板创建配置文件"\n\
 elif [ ! -s /app/config/config.json ]; then\n\
     echo "警告：配置文件为空！"\n\
@@ -79,7 +83,7 @@ elif [ ! -s /app/config/config.json ]; then\n\
     cp /app/config/config.json /app/config/config.json.empty.backup.$(date +%s)\n\
     echo "已备份空配置文件，从模板恢复..."\n\
     cp /app/template/config.template.json /app/config/config.json\n\
-    chmod 666 /app/config/config.json\n\
+    chmod 600 /app/config/config.json\n\
     echo "已从模板恢复配置文件"\n\
 else\n\
     echo "使用现有配置文件"\n\
@@ -87,6 +91,9 @@ fi\n\
 \n\
 exec python web_app.py' > start.sh && \
     chmod +x start.sh
+
+# 切换到非root用户
+USER appuser
 
 EXPOSE 5000
 

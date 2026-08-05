@@ -79,13 +79,14 @@ def api_retry(max_retries=1, delay_range=(2, 3), exclude_errors=None):
 class BaiduStorage:
     def __init__(self):
         self._client_lock = Lock()  # 添加客户端初始化锁
-        # Use ConfigManager as the single source of truth for config
+        # ConfigManager is the single source of truth for config
         self._config_mgr = ConfigManager()
-        self.config = self._config_mgr.config
+        # All config reads go through _config_mgr; never hold a stale copy
+        self._refresh_config()
         # 确保所有任务都有 task_uid
         if self._ensure_task_uids():
             self._config_mgr.save_config()
-            self.config = self._config_mgr.config
+            self._refresh_config()
         self.client = None
         self._init_client()
         self.last_request_time = 0
@@ -97,130 +98,25 @@ class BaiduStorage:
         self._user_info_cache = None
         self._user_info_cache_time = 0
         self._cache_ttl = 30  # 缓存有效期（秒）
-        
-    def _load_config(self):
-        try:
-            # 检查配置文件是否存在且不为空
-            if not os.path.exists('config/config.json') or os.path.getsize('config/config.json') == 0:
-                logger.warning("配置文件不存在或为空，将从模板创建")
-                self._create_config_from_template()
-            
-            with open('config/config.json', 'r', encoding='utf-8') as f:
-                config = json.load(f)
-                # 确保配置文件结构完整
-                if 'baidu' not in config:
-                    config['baidu'] = {}
-                if 'users' not in config['baidu']:
-                    config['baidu']['users'] = {}
-                if 'current_user' not in config['baidu']:
-                    config['baidu']['current_user'] = None
-                if 'tasks' not in config['baidu']:
-                    config['baidu']['tasks'] = []
-                if 'cron' not in config:
-                    config['cron'] = {
-                        'default_schedule': '*/5 * * * *',
-                        'auto_install': True
-                    }
-                # 添加 auth 配置结构
-                if 'auth' not in config:
-                    config['auth'] = {
-                        'users': 'admin',
-                        'password': 'admin123',
-                        'session_timeout': 3600
-                    }
-                return config
-        except FileNotFoundError:
-            return {
-                'baidu': {
-                    'users': {},
-                    'current_user': None,
-                    'tasks': []
-                },
-                'cron': {
-                    'default_schedule': '*/5 * * * *',
-                    'auto_install': True
-                },
-                'auth': {
-                    'users': 'admin',
-                    'password': 'admin123',
-                    'session_timeout': 3600
-                }
-            }
-        except Exception as e:
-            logger.error(f"加载配置文件失败: {str(e)}")
-            raise
-    
-    def _create_config_from_template(self):
-        """从模板创建配置文件"""
-        try:
-            # 查找模板文件
-            template_paths = [
-                'config/config.template.json',
-                'template/config.template.json'
-            ]
-            
-            template_path = None
-            for path in template_paths:
-                if os.path.exists(path):
-                    template_path = path
-                    break
-            
-            if not template_path:
-                logger.error("找不到配置模板文件")
-                raise FileNotFoundError("配置模板文件不存在")
-            
-            # 备份现有配置文件（如果存在）
-            if os.path.exists('config/config.json'):
-                backup_path = f'config/config.json.backup.{int(time.time())}'
-                shutil.copy2('config/config.json', backup_path)
-                logger.info(f"已备份现有配置文件到: {backup_path}")
-            
-            # 从模板复制配置文件
-            os.makedirs('config', exist_ok=True)
-            shutil.copy2(template_path, 'config/config.json')
-            logger.info(f"已从模板 {template_path} 创建配置文件")
-            
-        except Exception as e:
-            logger.error(f"从模板创建配置文件失败: {str(e)}")
-            raise
-            
+
+    def _refresh_config(self):
+        """Refresh config snapshot from ConfigManager (read-only deep copy)."""
+        self.config = self._config_mgr.config
+
     def _save_config(self, update_scheduler=True):
-        """保存配置到文件（原子写入）"""
-        try:
-            # 在保存前清理 None 值的 cron 字段
-            for task in self.config.get('baidu', {}).get('tasks', []):
-                if 'cron' in task and task['cron'] is None:
-                    del task['cron']
+        """Save config via ConfigManager (single source of truth).
 
-            # 原子写入：写入临时文件，然后重命名
-            config_dir = os.path.dirname('config/config.json') or '.'
-            os.makedirs(config_dir, exist_ok=True)
+        Delegates to ConfigManager.import_and_save_config() for atomic writes
+        with proper locking, fsync, and 0600 permissions.
+        """
+        self._config_mgr.import_and_save_config(self.config)
+        self._refresh_config()
 
-            tmp_path = os.path.join(config_dir, f'config.json.tmp.{int(time.time())}')
-            try:
-                with open(tmp_path, 'w', encoding='utf-8') as f:
-                    json.dump(self.config, f, ensure_ascii=False, indent=4)
-                os.chmod(tmp_path, 0o644)
-                os.replace(tmp_path, 'config/config.json')
-            finally:
-                # 清理临时文件（如果重命名失败）
-                if os.path.exists(tmp_path):
-                    try:
-                        os.remove(tmp_path)
-                    except OSError:
-                        pass
-
-            logger.debug("配置保存成功（原子写入）")
-            
-            # 通知调度器更新任务
-            if update_scheduler:
-                from scheduler import TaskScheduler
-                if hasattr(TaskScheduler, 'instance') and TaskScheduler.instance:
-                    TaskScheduler.instance.update_tasks()
-            
-        except Exception as e:
-            logger.error(f"保存配置失败: {str(e)}")
-            raise
+        # 通知调度器更新任务
+        if update_scheduler:
+            from scheduler import TaskScheduler
+            if hasattr(TaskScheduler, 'instance') and TaskScheduler.instance:
+                TaskScheduler.instance.update_tasks()
             
     def _init_client(self):
         """初始化客户端"""

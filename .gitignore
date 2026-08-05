@@ -31,8 +31,11 @@ Thumbs.db
 *.swp
 *.swo
 
-# 测试文件
-test_*.py
+# 测试文件（不忽略测试文件，测试应提交到仓库）
+# 只忽略测试缓存和产物
+.pytest_cache/
+coverage.xml
+htmlcov/
 
 # 参考文件
 *参考*.py

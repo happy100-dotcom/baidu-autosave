@@ -1,4 +1,5 @@
 from flask import Flask, request, jsonify, render_template, send_from_directory, session, redirect, url_for, Response, stream_with_context
+from werkzeug.security import generate_password_hash, check_password_hash
 from storage import BaiduStorage
 from scheduler import TaskScheduler
 import json
@@ -81,7 +82,14 @@ logger.add("log/web_app_{time:YYYY-MM-DD}.log",
 app = Flask(__name__)
 # SESSION_SECRET from environment — production must set this
 app.secret_key = os.environ.get('SESSION_SECRET')
-if not app.secret_key:
+app_env = os.environ.get('APP_ENV', 'development')
+if app_env == 'production':
+    if not app.secret_key or len(app.secret_key) < 32:
+        raise RuntimeError(
+            'SESSION_SECRET must be set to at least 32 characters '
+            'when APP_ENV=production'
+        )
+elif not app.secret_key:
     # In dev, generate a random key; production config MUST set it
     import secrets
     app.secret_key = secrets.token_hex(32)
@@ -250,6 +258,20 @@ def init_app():
         # 初始化存储
         logger.info("正在初始化存储...")
         storage = BaiduStorage()
+
+        # 处理 ADMIN_PASSWORD 环境变量：首次启动时设置密码hash
+        admin_password = os.environ.get('ADMIN_PASSWORD', '').strip()
+        if admin_password:
+            auth_config = storage.config.get('auth', {})
+            current_hash = auth_config.get('password_hash', '')
+            if not current_hash:
+                auth_config['password_hash'] = generate_password_hash(admin_password)
+                auth_config.pop('password', None)  # 删除旧明文密码字段
+                storage.config['auth'] = auth_config
+                storage._save_config()
+                logger.info('Admin password set from ADMIN_PASSWORD environment variable')
+            else:
+                logger.debug('password_hash already set, ADMIN_PASSWORD env var ignored')
         
         # 使用已创建的 storage 实例初始化调度器
         try:
@@ -307,10 +329,19 @@ def login():
             # 对于POST请求，返回JSON响应（新前端使用API）
             return jsonify({'success': False, 'message': '系统未初始化'}), 400
             
-        # 验证用户名和密码
+        # 验证用户名和密码 (使用password_hash)
         auth_config = storage.config.get('auth', {})
-        if (username == auth_config.get('users') and 
-            password == auth_config.get('password')):
+        password_hash = auth_config.get('password_hash', '')
+        
+        # 如果password_hash为空，拒绝登录并提示设置密码
+        if not password_hash:
+            return jsonify({
+                'success': False,
+                'message': '需要先设置密码才能登录，请通过环境变量ADMIN_PASSWORD设置'
+            }), 401
+        
+        if (username == auth_config.get('users') and
+                check_password_hash(password_hash, password)):
             session['username'] = username
             session['login_time'] = time.time()
             
@@ -1613,10 +1644,19 @@ def api_login():
     if not storage:
         return jsonify({'success': False, 'message': '系统未初始化'}), 400
         
-    # 验证用户名和密码
+    # 验证用户名和密码 (使用password_hash)
     auth_config = storage.config.get('auth', {})
-    if (username == auth_config.get('users') and 
-        password == auth_config.get('password')):
+    password_hash = auth_config.get('password_hash', '')
+    
+    # 如果password_hash为空，拒绝登录
+    if not password_hash:
+        return jsonify({
+            'success': False,
+            'message': '需要先设置密码才能登录，请通过环境变量ADMIN_PASSWORD设置'
+        }), 401
+    
+    if (username == auth_config.get('users') and
+            check_password_hash(password_hash, password)):
         session['username'] = username
         session['login_time'] = time.time()
         
@@ -1671,14 +1711,16 @@ def update_auth():
     if not new_username or not new_password or not old_password:
         return jsonify({'success': False, 'message': '用户名、新密码和旧密码都不能为空'})
     
-    # 验证旧密码
+    # 验证旧密码 (使用password_hash)
     auth_config = storage.config.get('auth', {})
-    if old_password != auth_config.get('password'):
+    password_hash = auth_config.get('password_hash', '')
+    if not password_hash or not check_password_hash(password_hash, old_password):
         return jsonify({'success': False, 'message': '旧密码错误'})
     
-    # 更新配置
+    # 更新配置（只保存hash，不保存明文）
     auth_config['users'] = new_username
-    auth_config['password'] = new_password
+    auth_config['password_hash'] = generate_password_hash(new_password)
+    auth_config.pop('password', None)  # 删除旧明文密码字段
     storage.config['auth'] = auth_config
     storage._save_config()
     
