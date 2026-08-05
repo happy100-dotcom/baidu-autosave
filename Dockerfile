@@ -37,10 +37,19 @@ RUN python -m venv /opt/venv && \
 # 阶段3: 创建最终镜像
 FROM python:3.10-slim
 
+# 安装 gosu（用于降权）
+RUN set -ex; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends gosu; \
+    rm -rf /var/lib/apt/lists/*; \
+    # verify that gosu works
+    gosu nobody true
+
 # 设置时区和环境变量
 ENV PYTHONUNBUFFERED=1 \
     TZ=Asia/Shanghai \
-    PATH="/opt/venv/bin:$PATH"
+    PATH="/opt/venv/bin:$PATH" \
+    APP_ENV=production
 
 # 从构建阶段复制虚拟环境
 COPY --from=backend-builder /opt/venv /opt/venv
@@ -61,40 +70,49 @@ COPY config/config.template.json ./template/config.template.json
 # 创建非root用户
 RUN useradd -m -u 1000 -s /bin/bash appuser
 
-# 创建目录并设置权限
+# 创建目录并设置权限（root 拥有，appuser 可读写）
 RUN mkdir -p config log template && \
+    chown -R appuser:appuser config log template && \
     chmod 750 config log template && \
     chmod 640 template/config.template.json
 
-# 创建启动脚本
-RUN echo '#!/bin/sh\n\
+# 创建启动入口脚本
+# 入口脚本以 root 运行，检查/创建目录并 chown，后用 gosu 降权执行 Python
+RUN echo '#!/bin/bash\n\
+set -e\n\
+\n\
 # 等待卷挂载完成\n\
 sleep 2\n\
+\n\
+# 确保 config/log 目录存在且 appuser 可写\n\
+mkdir -p /app/config /app/log\n\
+chown -R appuser:appuser /app/config /app/log\n\
+chmod 750 /app/config /app/log\n\
 \n\
 # 检查配置文件\n\
 if [ ! -f /app/config/config.json ]; then\n\
     echo "配置文件不存在，从模板创建..."\n\
     cp /app/template/config.template.json /app/config/config.json\n\
+    chown appuser:appuser /app/config/config.json\n\
     chmod 600 /app/config/config.json\n\
     echo "已从模板创建配置文件"\n\
 elif [ ! -s /app/config/config.json ]; then\n\
     echo "警告：配置文件为空！"\n\
-    # 备份空文件\n\
     cp /app/config/config.json /app/config/config.json.empty.backup.$(date +%s)\n\
     echo "已备份空配置文件，从模板恢复..."\n\
     cp /app/template/config.template.json /app/config/config.json\n\
+    chown appuser:appuser /app/config/config.json\n\
     chmod 600 /app/config/config.json\n\
     echo "已从模板恢复配置文件"\n\
 else\n\
     echo "使用现有配置文件"\n\
 fi\n\
 \n\
-exec python web_app.py' > start.sh && \
-    chmod +x start.sh
-
-# 切换到非root用户
-USER appuser
+# 降权执行 Python 应用\n\
+exec gosu appuser python web_app.py\n\
+' > /entrypoint.sh && \
+    chmod +x /entrypoint.sh
 
 EXPOSE 5000
 
-CMD ["./start.sh"]
+ENTRYPOINT ["/entrypoint.sh"]

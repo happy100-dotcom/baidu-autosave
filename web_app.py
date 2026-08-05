@@ -1,5 +1,6 @@
 from flask import Flask, request, jsonify, render_template, send_from_directory, session, redirect, url_for, Response, stream_with_context
 from werkzeug.security import generate_password_hash, check_password_hash
+from config_manager import ConfigManager, ConfigValidationError, ConfigMigrationError
 from storage import BaiduStorage
 from scheduler import TaskScheduler
 import json
@@ -98,7 +99,14 @@ elif not app.secret_key:
         'Using temporary random key — sessions will break on restart. '
         'Set SESSION_SECRET in production.'
     )
-CORS(app)
+# CORS — restrict to same-origin by default, allow CORS_ORIGINS env var override
+cors_origins = os.environ.get('CORS_ORIGINS', '').strip()
+if cors_origins:
+    origins = [o.strip() for o in cors_origins.split(',') if o.strip()]
+    CORS(app, origins=origins, supports_credentials=True)
+else:
+    # Same-origin only: no CORS headers needed
+    pass
 
 # 全局变量声明
 storage = None
@@ -288,7 +296,11 @@ def init_app():
             
         logger.info("应用初始化完成")
         return True, None
-        
+
+    except ConfigMigrationError as e:
+        error_msg = f"配置迁移失败，应用无法启动: {str(e)}"
+        logger.error(error_msg)
+        return False, error_msg
     except Exception as e:
         error_msg = f"应用初始化失败: {str(e)}"
         logger.error(error_msg)
@@ -799,7 +811,7 @@ def execute_task():
                     
                     storage.update_task_status_by_order(
                         task_order,
-                        'normal',
+                        'success',
                         '转存成功',
                         transferred_files=transferred_files
                     )
@@ -807,7 +819,7 @@ def execute_task():
                     _append_task_log(task_order, '任务执行完成', task_uid=task_uid)
                     _publish_task_completed(task_order, task_uid)
                 else:
-                    storage.update_task_status_by_order(task_order, 'normal', '没有新文件需要转存')
+                    storage.update_task_status_by_order(task_order, 'skipped', '没有新文件需要转存')
                     _publish_task_status(task_order, task_uid)
                     _append_task_log(task_order, '没有新文件需要转存', task_uid=task_uid)
                     _publish_task_completed(task_order, task_uid)
@@ -1089,6 +1101,7 @@ def get_config():
     
     auth_config = dict(storage.config.get('auth', {}))
     auth_config.pop('password', None)
+    auth_config.pop('password_hash', None)
 
     config = {
         'cron': storage.config.get('cron', {}),
@@ -1150,21 +1163,19 @@ def update_config():
         # 从data中移除notify，避免后续update重复处理
         del data['notify']
     
-    # 处理认证配置：保留现有密码，避免前端读取或误覆盖
+    # 处理认证配置：只允许修改 users 和 session_timeout，密码必须通过 /api/auth/update
     if 'auth' in data:
         current_auth = dict(storage.config.get('auth', {}))
         incoming_auth = data.get('auth') or {}
         merged_auth = {
             'users': incoming_auth.get('users', current_auth.get('users', '')),
-            'session_timeout': incoming_auth.get('session_timeout', current_auth.get('session_timeout', 3600))
+            'session_timeout': incoming_auth.get('session_timeout', current_auth.get('session_timeout', 3600)),
+            'password_hash': current_auth.get('password_hash', ''),
         }
+        # 拒绝通过通用接口写入明文密码
+        merged_auth.pop('password', None)
 
-        new_password = incoming_auth.get('password')
-        if isinstance(new_password, str) and new_password.strip():
-            merged_auth['password'] = new_password
-        elif 'password' in current_auth:
-            merged_auth['password'] = current_auth['password']
-
+        # 如果前端传了 password，忽略它（避免意外清除哈希）
         storage.config['auth'] = merged_auth
         del data['auth']
 

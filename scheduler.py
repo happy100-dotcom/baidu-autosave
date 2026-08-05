@@ -559,7 +559,7 @@ class TaskScheduler:
             logger.info(f"开始执行任务: {task_name}")
             logger.info(f"分享链接: {current_task.get('url', '')}")
             logger.info(f"保存目录: {current_task.get('save_dir', '')}")
-            logger.info(f"提取码: {current_task.get('pwd', '')}")
+            logger.info("提取码: [已隐藏]")
             logger.info("")
             
             # 确保存储实例可用

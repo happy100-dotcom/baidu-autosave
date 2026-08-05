@@ -29,6 +29,13 @@ def _format_transfer_error(error_str):
         return "转存错误"
     return error_str
 
+def _sanitize_share_url(url):
+    """Remove password from share URL for logging."""
+    if not url:
+        return url
+    return re.sub(r'[?&]pwd=[^&\s]+', '&pwd=***', url).replace('&pwd=***', '?pwd=***')
+
+
 def api_retry(max_retries=1, delay_range=(2, 3), exclude_errors=None):
     """
     API重试装饰器
@@ -83,9 +90,9 @@ class BaiduStorage:
         self._config_mgr = ConfigManager()
         # All config reads go through _config_mgr; never hold a stale copy
         self._refresh_config()
-        # 确保所有任务都有 task_uid
+        # 确保所有任务都有 task_uid — 通过 import_and_save_config 提交修改后的副本
         if self._ensure_task_uids():
-            self._config_mgr.save_config()
+            self._config_mgr.import_and_save_config(self.config)
             self._refresh_config()
         self.client = None
         self._init_client()
@@ -1208,7 +1215,7 @@ class BaiduStorage:
             try:
                 # 访问分享链接
                 if pwd:
-                    logger.info(f"使用密码 {pwd} 访问分享链接")
+                    logger.info("使用密码访问分享链接")
                 if progress_callback:
                         progress_callback('info', f'使用密码访问分享链接')
                 self._access_shared_with_retry(share_url, pwd, client=temp_client)
@@ -1786,9 +1793,9 @@ class BaiduStorage:
     def list_shared_files(self, share_url, pwd=None):
         """获取分享链接中的文件列表"""
         try:
-            logger.info(f"开始获取分享链接 {share_url} 的文件列表")
+            logger.info(f"开始获取分享链接 {_sanitize_share_url(share_url)} 的文件列表")
             if pwd:
-                logger.info(f"使用密码 {pwd} 访问分享链接")
+                logger.info("使用密码访问分享链接")
                 
             logger.debug("开始访问分享链接...")
             self._access_shared_with_retry(share_url, pwd)

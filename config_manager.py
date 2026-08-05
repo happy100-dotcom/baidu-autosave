@@ -64,6 +64,16 @@ DEFAULT_GLOBAL_SETTINGS = {
 
 # ── helpers ────────────────────────────────────────────────────────────────
 
+class ConfigValidationError(Exception):
+    """Raised when a config dict fails validation."""
+    pass
+
+
+class ConfigMigrationError(Exception):
+    """Raised when config migration fails."""
+    pass
+
+
 def _ensure_dir_exists(path):
     """Ensure parent directory exists."""
     parent = os.path.dirname(path)
@@ -257,25 +267,80 @@ class ConfigManager:
     def import_and_save_config(self, config_dict):
         """Import an external config dict and persist it atomically.
 
-        This is the bridge for legacy code that still modifies config
-        copies.  Takes the config under RLock, deep-copies the data,
-        validates it, and writes atomically.
+        Takes the config under RLock, validates the candidate,
+        deep-copies the data, writes atomically, and only commits
+        the new config to memory on success.  On failure the old
+        config is preserved both in memory and on disk.
 
         Args:
             config_dict: A config dict (e.g. from a modified copy).
 
         Returns:
             bool: True if successful.
+
+        Raises:
+            ConfigValidationError: If the candidate config fails validation.
+            IOError: If the atomic write fails.
         """
         with self._lock:
+            previous = self._config
+            candidate = copy.deepcopy(config_dict)
+
+            # Validate the candidate
+            errors = self._validate_config_dict(candidate)
+            if errors:
+                msg = '; '.join(f'{path}: {err}' for path, err in errors)
+                logger.error(f'Config validation failed: {msg}')
+                raise ConfigValidationError(msg)
+
             try:
-                # Deep-copy the incoming data to prevent external mutations
-                self._config = copy.deepcopy(config_dict)
+                self._config = candidate
                 self._save_config_internal()
                 return True
             except Exception as e:
-                logger.error(f'Failed to import config: {e}')
-                return False
+                # Rollback memory to previous state
+                self._config = previous
+                logger.error(f'Failed to import config, rolled back: {e}')
+                raise
+
+    def _validate_config_dict(self, config_dict):
+        """Validate a config dict independently of current state.
+
+        Returns:
+            list of (path, error) tuples.
+        """
+        errors = []
+
+        # Must be a dict
+        if not isinstance(config_dict, dict):
+            errors.append(('root', 'Config must be a dict'))
+            return errors
+
+        version = config_dict.get('config_schema_version', 1)
+        if version != 2:
+            errors.append(('config_schema_version', f'Expected 2, got {version}'))
+
+        baidu = config_dict.get('baidu', {})
+        if not isinstance(baidu, dict):
+            errors.append(('baidu', 'baidu section must be a dict'))
+
+        tasks = baidu.get('tasks', []) if isinstance(baidu, dict) else []
+        if not isinstance(tasks, list):
+            errors.append(('baidu.tasks', 'tasks must be a list'))
+            return errors
+
+        for i, task in enumerate(tasks):
+            task_errors = validate_task(task)
+            for err in task_errors:
+                errors.append((f'tasks[{i}]', err))
+
+        # Verify auth section has no password field
+        auth = config_dict.get('auth', {})
+        if isinstance(auth, dict):
+            if 'password' in auth:
+                errors.append(('auth.password', 'password field must not be present, use password_hash'))
+
+        return errors
 
     def _create_backup(self, keep_max=5):
         """Create a timestamped backup of the current config file.
@@ -318,7 +383,7 @@ class ConfigManager:
     def _maybe_migrate(self):
         """Check schema version and migrate if needed.
 
-        On failure, keeps the original config and logs an error.
+        On failure, raises ConfigMigrationError to stop startup.
         Does NOT save the partially migrated config.
         """
         version = self._config.get('config_schema_version', 1)
@@ -335,12 +400,12 @@ class ConfigManager:
                     logger.info(f'Migration: {line}')
 
                 if not result['success']:
-                    logger.error(
-                        'Migration aborted due to semantic errors. '
-                        'Original config preserved. '
-                        'Fix the errors and try again.'
-                    )
-                    return
+                    error_lines = [l for l in result['log'] if 'ERROR' in l.upper() or 'SEMANTIC' in l.upper()]
+                    msg = 'Config migration aborted due to semantic errors'
+                    if error_lines:
+                        msg += ': ' + '; '.join(error_lines)
+                    logger.error(msg)
+                    raise ConfigMigrationError(msg)
 
                 self._config = result['config']
                 self._save_config_internal()
